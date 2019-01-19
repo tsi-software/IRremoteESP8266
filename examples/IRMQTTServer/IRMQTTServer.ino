@@ -27,6 +27,7 @@
  *     - WiFiManager (https://github.com/tzapu/WiFiManager) (Version >= 0.14)
  *     - PubSubClient (https://pubsubclient.knolleary.net/)
  *   o You MUST change <PubSubClient.h> to have the following (or larger) value:
+ *     (with REPORT_RAW_UNKNOWNS 1024 or more is recommended)
  *     #define MQTT_MAX_PACKET_SIZE 512
  * - PlatformIO IDE:
  *     If you are using PlatformIO, this should already been done for you in
@@ -151,6 +152,8 @@
 // Change to 'true'/'false' if you do/don't want these features or functions.
 #define USE_STATIC_IP false  // Change to 'true' if you don't want to use DHCP.
 #define REPORT_UNKNOWNS false  // Report inbound IR messages that we don't know.
+#define REPORT_RAW_UNKNOWNS false  // Report the whole buffer, recommended:
+                                   // MQTT_MAX_PACKET_SIZE of 1024 or more
 #define MQTT_ENABLE true  // Whether or not MQTT is used at all.
 // 'kHtmlUsername' & 'kHtmlPassword' are used by the following two items:
 #define FIRMWARE_OTA true  // Allow remote update of the firmware via http.
@@ -190,6 +193,7 @@
 // GPIO the IR RX module is connected to/controlled by. GPIO 14 = D5.
 // Comment this out to disable receiving/decoding IR messages entirely.
 #define IR_RX 14  // <=- CHANGE_ME (optional)
+#define IR_RX_PULLUP false
 const uint16_t kHttpPort = 80;  // The TCP port the HTTP server is listening on.
 // Name of the device you want in mDNS.
 // NOTE: Changing this will change the MQTT path too unless you override it
@@ -257,7 +261,7 @@ const uint16_t kMinUnknownSize = 2 * 10;
 // ----------------- End of User Configuration Section -------------------------
 
 // Globals
-#define _MY_VERSION_ "v0.8.1"
+#define _MY_VERSION_ "v0.8.2"
 // HTML arguments we will parse for IR code information.
 #define argType "type"
 #define argData "code"
@@ -381,7 +385,11 @@ void handleRoot() {
     "Last message sent: " + String(lastSendSucceeded ? "Ok" : "FAILED") +
     " <i>(" + timeSince(lastSendTime) + ")</i><br>"
 #ifdef IR_RX
-    "IR Recv GPIO: " + String(IR_RX) + "<br>"
+    "IR Recv GPIO: " + String(IR_RX) +
+#if IR_RX_PULLUP
+    " (pullup)"
+#endif  // IR_RX_PULLUP
+    "<br>"
     "Total IR Received: " + String(irRecvCounter) + "<br>"
     "Last IR Received: " + lastIrReceived +
     " <i>(" + timeSince(lastIrReceivedTime) + ")</i><br>"
@@ -536,6 +544,7 @@ void handleRoot() {
       "<select name='type'>"
         "<option value='27'>Argo</option>"
         "<option value='16'>Daikin</option>"
+        "<option value='53'>Daikin2</option>"
         "<option value='48'>Electra</option>"
         "<option value='33'>Fujitsu</option>"
         "<option value='24'>Gree</option>"
@@ -630,6 +639,9 @@ bool parseStringAndSendAirCon(const uint16_t irType, const String str) {
       break;
     case DAIKIN:
       stateSize = kDaikinStateLength;
+      break;
+    case DAIKIN2:
+      stateSize = kDaikin2StateLength;
       break;
     case ELECTRA_AC:
       stateSize = kElectraAcStateLength;
@@ -760,7 +772,12 @@ bool parseStringAndSendAirCon(const uint16_t irType, const String str) {
       irsend.sendDaikin(reinterpret_cast<uint8_t *>(state));
       break;
 #endif
-#if MITSUBISHI_AC
+#if SEND_DAIKIN2
+    case DAIKIN2:
+      irsend.sendDaikin2(reinterpret_cast<uint8_t *>(state));
+      break;
+#endif
+#if SEND_MITSUBISHI_AC
     case MITSUBISHI_AC:
       irsend.sendMitsubishiAC(reinterpret_cast<uint8_t *>(state));
       break;
@@ -830,7 +847,7 @@ bool parseStringAndSendAirCon(const uint16_t irType, const String str) {
       irsend.sendPanasonicAC(reinterpret_cast<uint8_t *>(state));
       break;
 #endif
-#if SEND_MWM_
+#if SEND_MWM
     case MWM:
       irsend.sendMWM(reinterpret_cast<uint8_t *>(state), stateSize);
       break;
@@ -1103,6 +1120,9 @@ void setup(void) {
   irsend.begin();
   offset = irsend.calibrate();
 #if IR_RX
+#if IR_RX_PULLUP
+  pinMode(IR_RX, INPUT_PULLUP);
+#endif  // IR_RX_PULLUP
 #if DECODE_HASH
   // Ignore messages with less than minimum on or off pulses.
   irrecv.setUnknownThreshold(kMinUnknownSize);
@@ -1269,11 +1289,27 @@ void loop(void) {
 #if REPORT_UNKNOWNS
   if (irrecv.decode(&capture)) {
 #else
-  if (irrecv.decode(&capture) && capture.decode_type != -1) {
+  if (irrecv.decode(&capture) && capture.decode_type != UNKNOWN) {
 #endif  // REPORT_UNKNOWNS
     lastIrReceivedTime = millis();
     lastIrReceived = String(capture.decode_type) + "," +
         resultToHexidecimal(&capture);
+#if REPORT_RAW_UNKNOWNS
+    if (capture.decode_type == UNKNOWN) {
+      lastIrReceived += ";";
+      for (uint16_t i = 1; i < capture.rawlen; i++) {
+        uint32_t usecs;
+        for (usecs = capture.rawbuf[i] * kRawTick; usecs > UINT16_MAX;
+             usecs -= UINT16_MAX) {
+          lastIrReceived += uint64ToString(UINT16_MAX);
+          lastIrReceived += ",0,";
+        }
+        lastIrReceived += uint64ToString(usecs, 10);
+        if (i < capture.rawlen - 1)
+          lastIrReceived += ",";
+      }
+    }
+#endif  // REPORT_RAW_UNKNOWNS
     // If it isn't an AC code, add the bits.
     if (!hasACState(capture.decode_type))
       lastIrReceived += "," + String(capture.bits);
@@ -1429,6 +1465,7 @@ bool sendIRCode(int const ir_type, uint64_t const code, char const * code_str,
       break;
 #endif
     case DAIKIN:  // 16
+    case DAIKIN2:  // 53
     case KELVINATOR:  // 18
     case MITSUBISHI_AC:  // 20
     case GREE:  // 24
